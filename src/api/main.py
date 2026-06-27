@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes import router
 from src.api.provenance import router as prov_router
+from src.api.rag_routes import router as rag_router
 
 app = FastAPI(
     title="Horison ESG Scoring API",
@@ -25,6 +26,7 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api/v1")
 app.include_router(prov_router, prefix="/api/v1")
+app.include_router(rag_router, prefix="/api/v1")
 
 
 @app.get("/health")
