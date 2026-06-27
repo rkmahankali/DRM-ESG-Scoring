@@ -365,7 +365,7 @@ function renderMain(){
   </div>`:'';
 
   // Tabs
-  const tabs=['overview','pillars','metrics','audit'];
+  const tabs=['overview','pillars','metrics','audit','provenance'];
   const tabsHtml=`<div class="tabs">${tabs.map(t=>
     `<button class="tab${tab===t?' active':''}" data-tab="${t}">${t}</button>`
   ).join('')}</div>`;
@@ -503,6 +503,17 @@ function renderMain(){
     </div>`;
   }
 
+  if(tab==='provenance'){
+    content=`<div id="prov-container">
+      <div class="loading-state" style="height:200px">
+        <div class="loading-icon spin">⚙</div>
+        <div class="loading-text">Loading knowledge graph…</div>
+      </div>
+    </div>`;
+    // Fetch and render after DOM update
+    setTimeout(()=>loadProvenance(co.id, score.id, score), 50);
+  }
+
   return`<main>
     <div class="page-header">
       <div>
@@ -515,6 +526,395 @@ function renderMain(){
     ${alertsHtml}
     <div class="fade-in">${content}</div>
   </main>`;
+}
+
+// ── Provenance / Knowledge Graph ───────────────────────────────────────
+
+const NODE_META = {
+  Company:     {color:'#0f172a', r:28, textColor:'#fff'},
+  ESGScore:    {color:'#f59e0b', r:22, textColor:'#fff'},
+  PillarScore: {color:'#6366f1', r:20, textColor:'#fff'},
+  MetricScore: {color:'#22c55e', r:16, textColor:'#fff'},
+  EvidenceItem:{color:'#e2e8f0', r:13, textColor:'#475569'},
+};
+const EV_SOURCE_COLOR = {
+  api_feed:'#22c55e', regulatory_filing:'#3b82f6',
+  questionnaire:'#f59e0b', third_party:'#8b5cf6',
+  document:'#f97316', satellite:'#06b6d4',
+};
+
+async function loadProvenance(companyId, scoreId, score){
+  const container = document.getElementById('prov-container');
+  if(!container) return;
+  try{
+    const [graphRes, summaryRes] = await Promise.all([
+      fetch(`${API}/provenance/${companyId}/score/${scoreId}/graph`),
+      fetch(`${API}/provenance/${companyId}/evidence-summary`),
+    ]);
+    if(!graphRes.ok) throw new Error('graph fetch failed');
+    const graphData   = await graphRes.json();
+    const summaryData = await summaryRes.json();
+    container.innerHTML = renderProvenance(graphData, summaryData.summary, score);
+    initForceGraph(graphData);
+  } catch(e){
+    container.innerHTML=`<div class="card" style="padding:20px;color:#dc2626">
+      Failed to load provenance graph: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderProvenance(graph, summary, score){
+  // Evidence summary table
+  const summaryRows = (summary||[]).map(s=>`
+    <tr>
+      <td style="padding:6px 10px;font-weight:600;color:#334155">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;
+          background:${EV_SOURCE_COLOR[s.source]||'#94a3b8'};margin-right:6px"></span>${s.source}
+      </td>
+      <td style="padding:6px 10px;color:#64748b;text-transform:capitalize">${s.evidence_type}</td>
+      <td style="padding:6px 10px;text-align:center">
+        ${s.verified?'<span style="color:#16a34a;font-weight:700">✓ Verified</span>':'<span style="color:#94a3b8">Self-reported</span>'}
+      </td>
+      <td style="padding:6px 10px;text-align:center;font-weight:700;color:#334155">${s.count}</td>
+      <td style="padding:6px 10px;text-align:center">
+        <div style="display:flex;align-items:center;gap:6px;justify-content:center">
+          <div style="width:40px;height:5px;background:#f1f5f9;border-radius:3px;overflow:hidden">
+            <div style="width:${Math.round(s.avg_confidence*100)}%;height:100%;background:#6366f1;border-radius:3px"></div>
+          </div>
+          <span style="font-size:11px;color:#64748b">${Math.round(s.avg_confidence*100)}%</span>
+        </div>
+      </td>
+    </tr>`).join('');
+
+  // Node type legend
+  const legend = Object.entries(NODE_META).map(([label,m])=>`
+    <div style="display:flex;align-items:center;gap:6px;font-size:11px;color:#475569">
+      <div style="width:12px;height:12px;border-radius:50%;background:${m.color};flex-shrink:0"></div>
+      ${label}
+    </div>`).join('');
+
+  return `
+    <!-- Graph canvas -->
+    <div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">
+      <div style="padding:16px 20px 12px;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div style="font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:1px">Evidence Provenance Graph</div>
+          <div style="font-size:11px;color:#94a3b8;margin-top:2px">
+            ${graph.nodes.length} nodes · ${graph.edges.length} edges · drag to explore
+          </div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">${legend}</div>
+      </div>
+      <div style="position:relative;background:#0f172a">
+        <svg id="prov-svg" width="100%" height="480" style="display:block"></svg>
+        <div id="prov-tooltip" style="display:none;position:absolute;background:#1e293b;color:#f8fafc;
+          padding:8px 12px;border-radius:8px;font-size:12px;pointer-events:none;
+          border:1px solid #334155;max-width:240px;z-index:10;line-height:1.5"></div>
+      </div>
+    </div>
+
+    <!-- Evidence summary table -->
+    <div class="card" style="padding:20px;margin-bottom:16px">
+      <div style="font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px">
+        Evidence Sources
+      </div>
+      <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="border-bottom:2px solid #f1f5f9">
+            ${['Source','Type','Verification','Count','Avg. Confidence'].map(h=>
+              `<th style="padding:6px 10px;text-align:left;color:#94a3b8;font-size:10px;font-weight:700;
+                letter-spacing:.5px;text-transform:uppercase;white-space:nowrap">${h}</th>`
+            ).join('')}
+          </tr></thead>
+          <tbody>${summaryRows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Provenance trail -->
+    <div class="card" style="padding:20px">
+      <div style="font-size:12px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">
+        Full Evidence Trail
+      </div>
+      <div style="font-size:11px;color:#94a3b8;margin-bottom:12px">
+        Click a node in the graph above to filter. Every metric score is traced to its source evidence.
+      </div>
+      <div id="prov-trail-container">
+        ${renderTrailFromGraph(graph)}
+      </div>
+    </div>`;
+}
+
+function renderTrailFromGraph(graph, filterMetricId=null){
+  // Group evidence nodes by the metric score they back
+  const metricNodes  = graph.nodes.filter(n=>n.label==='MetricScore');
+  const evidenceNodes= graph.nodes.filter(n=>n.label==='EvidenceItem');
+  const edges        = graph.edges;
+
+  const filtered = filterMetricId
+    ? metricNodes.filter(m=>m.metric_id===filterMetricId)
+    : metricNodes.filter(m=>m.score>0);
+
+  if(!filtered.length) return '<div style="color:#94a3b8;font-size:13px">No metric scores with evidence found.</div>';
+
+  return filtered.map(ms=>{
+    const evIds  = edges.filter(e=>e.source===ms.id&&e.rel==='BACKED_BY').map(e=>e.target);
+    const evList = evidenceNodes.filter(e=>evIds.includes(e.id));
+    const pillarCol = {E:'#22c55e',S:'#3b82f6',G:'#8b5cf6'}[ms.pillar]||'#94a3b8';
+    return `
+      <div style="border:1px solid #f1f5f9;border-radius:10px;margin-bottom:10px;overflow:hidden">
+        <div style="padding:10px 14px;background:#f8fafc;display:flex;align-items:center;gap:10px">
+          <span style="background:${pillarCol}18;color:${pillarCol};padding:2px 8px;
+            border-radius:999px;font-size:11px;font-weight:700">${ms.pillar}</span>
+          <span style="font-weight:700;color:#334155;font-size:13px">${ms.metric_id}</span>
+          <span style="color:#64748b;font-size:12px">— ${ms.metric_name||''}</span>
+          <span style="margin-left:auto;font-size:18px;font-weight:800;color:${sc(ms.score)}">${ms.score}</span>
+          ${ms.outcome_based?'<span style="font-size:10px;background:#f0fdf4;color:#16a34a;padding:1px 7px;border-radius:999px;font-weight:600">Outcome</span>':''}
+        </div>
+        ${evList.length===0
+          ? '<div style="padding:10px 14px;font-size:12px;color:#cbd5e1;font-style:italic">No direct evidence linked</div>'
+          : evList.map(ev=>`
+          <div style="padding:9px 14px;border-top:1px solid #f8fafc;display:flex;align-items:flex-start;gap:10px;font-size:12px">
+            <div style="width:8px;height:8px;border-radius:50%;margin-top:3px;flex-shrink:0;
+              background:${EV_SOURCE_COLOR[ev.source]||'#94a3b8'}"></div>
+            <div style="flex:1">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <span style="font-weight:600;color:#334155;text-transform:capitalize">${ev.source||''}</span>
+                <span style="background:#f1f5f9;color:#64748b;padding:1px 7px;border-radius:999px;
+                  font-size:10px;text-transform:capitalize">${ev.type||''}</span>
+                ${ev.verified
+                  ? '<span style="background:#f0fdf4;color:#16a34a;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:600">✓ Verified</span>'
+                  : '<span style="background:#fef3c7;color:#92400e;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:600">Self-reported</span>'}
+                <span style="margin-left:auto;font-weight:700;color:#334155">
+                  Norm: ${ev.value!=null?ev.value+'%':'—'}
+                </span>
+                <span style="color:#94a3b8">conf. ${Math.round((ev.confidence||0)*100)}%</span>
+              </div>
+            </div>
+          </div>`).join('')}
+      </div>`;
+  }).join('');
+}
+
+function initForceGraph(graphData){
+  const svg = document.getElementById('prov-svg');
+  if(!svg||!graphData.nodes.length) return;
+
+  const W = svg.clientWidth||800, H=480;
+  const CX=W/2, CY=H/2;
+
+  // Simple force-directed layout using iterative repulsion + spring forces
+  const nodes = graphData.nodes.map((n,i)=>({
+    ...n,
+    x: CX + (Math.random()-.5)*300,
+    y: CY + (Math.random()-.5)*200,
+    vx:0, vy:0,
+  }));
+  const nodeById = Object.fromEntries(nodes.map(n=>[n.id,n]));
+  const edges = graphData.edges.map(e=>({
+    ...e,
+    source: nodeById[e.source],
+    target: nodeById[e.target],
+  })).filter(e=>e.source&&e.target);
+
+  // Assign fixed positions by label tier (hierarchical layout)
+  const tiers = {Company:0, ESGScore:1, PillarScore:2, MetricScore:3, EvidenceItem:4};
+  const tierCounts = {};
+  nodes.forEach(n=>{
+    const t = tiers[n.label]??3;
+    tierCounts[t]=(tierCounts[t]||0)+1;
+  });
+  const tierIdx = {};
+  nodes.forEach(n=>{
+    const t=tiers[n.label]??3;
+    tierIdx[t]=(tierIdx[t]||0);
+    const count=tierCounts[t];
+    const xOffset = count===1?0:((tierIdx[t]/(count-1))-.5)*(W*.8);
+    n.x = CX + xOffset;
+    n.y = 60 + t*(H-80)/4;
+    tierIdx[t]++;
+    n.fx = n.x; // fixed horizontal, allow small vertical drift
+  });
+
+  // Run a few iterations of force simulation
+  for(let iter=0;iter<80;iter++){
+    // Repulsion between nodes at same tier
+    for(let i=0;i<nodes.length;i++){
+      for(let j=i+1;j<nodes.length;j++){
+        const a=nodes[i],b=nodes[j];
+        if((tiers[a.label]??3)!==(tiers[b.label]??3)) continue;
+        const dx=b.x-a.x, dy=b.y-a.y;
+        const dist=Math.sqrt(dx*dx+dy*dy)||1;
+        const force=1200/(dist*dist);
+        const fx=dx/dist*force, fy=dy/dist*force;
+        a.x-=fx*.5; b.x+=fx*.5;
+        a.y-=fy*.3; b.y+=fy*.3;
+      }
+    }
+    // Spring attraction along edges
+    edges.forEach(e=>{
+      const dx=e.target.x-e.source.x, dy=e.target.y-e.source.y;
+      const dist=Math.sqrt(dx*dx+dy*dy)||1;
+      const ideal=100;
+      const force=(dist-ideal)*0.02;
+      const fx=dx/dist*force, fy=dy/dist*force;
+      e.source.x+=fx; e.target.x-=fx;
+    });
+    // Re-pin horizontal tiers
+    nodes.forEach(n=>{n.x=Math.max(30,Math.min(W-30,n.x));});
+  }
+
+  // Render
+  function nodeLabel(n){
+    if(n.label==='Company') return n.name||n.id.slice(0,8);
+    if(n.label==='ESGScore') return `ESG\n${n.score}`;
+    if(n.label==='PillarScore') return `${n.pillar}\n${n.score}`;
+    if(n.label==='MetricScore') return `${n.metric_id}\n${n.score}`;
+    if(n.label==='EvidenceItem') return `${(n.source||'').replace('_','\n')}\n${n.value!=null?n.value+'%':'?'}`;
+    return n.id.slice(0,8);
+  }
+
+  function evNodeFill(n){
+    if(n.label!=='EvidenceItem') return NODE_META[n.label]?.color||'#94a3b8';
+    return EV_SOURCE_COLOR[n.source]||'#94a3b8';
+  }
+
+  let selected = null;
+
+  function draw(){
+    svg.innerHTML='';
+    // Defs: arrow marker
+    svg.innerHTML=`<defs>
+      <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="#334155" opacity=".6"/>
+      </marker>
+    </defs>`;
+
+    // Edges
+    edges.forEach(e=>{
+      const src=e.source,tgt=e.target;
+      const col = selected&&(selected.id===src.id||selected.id===tgt.id)?'#f59e0b':'#334155';
+      const op  = selected&&(selected.id!==src.id&&selected.id!==tgt.id)?'0.15':'0.55';
+      const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+      line.setAttribute('x1',src.x); line.setAttribute('y1',src.y);
+      line.setAttribute('x2',tgt.x); line.setAttribute('y2',tgt.y);
+      line.setAttribute('stroke',col);
+      line.setAttribute('stroke-width',selected&&(selected.id===src.id||selected.id===tgt.id)?'2':'1.5');
+      line.setAttribute('stroke-opacity',op);
+      line.setAttribute('marker-end','url(#arr)');
+      svg.appendChild(line);
+      // Edge label
+      if(e.rel==='BACKED_BY'&&e.contribution!=null){
+        const lbl=document.createElementNS('http://www.w3.org/2000/svg','text');
+        lbl.setAttribute('x',(src.x+tgt.x)/2); lbl.setAttribute('y',(src.y+tgt.y)/2-3);
+        lbl.setAttribute('text-anchor','middle');
+        lbl.setAttribute('font-size','8');
+        lbl.setAttribute('fill','#64748b');
+        lbl.setAttribute('font-family','system-ui');
+        lbl.textContent=(e.contribution*100).toFixed(0)+'%';
+        svg.appendChild(lbl);
+      }
+    });
+
+    // Nodes
+    nodes.forEach(n=>{
+      const meta = NODE_META[n.label]||{color:'#64748b',r:14,textColor:'#fff'};
+      const fill = evNodeFill(n);
+      const isSel= selected&&selected.id===n.id;
+      const isDim= selected&&selected.id!==n.id&&
+                   !edges.some(e=>e.source.id===selected.id&&e.target.id===n.id||
+                                  e.target.id===selected.id&&e.source.id===n.id);
+      const g=document.createElementNS('http://www.w3.org/2000/svg','g');
+      g.style.cursor='pointer';
+      g.style.opacity=isDim?'0.25':'1';
+      g.style.transition='opacity .2s';
+
+      // Outer glow if selected
+      if(isSel){
+        const glow=document.createElementNS('http://www.w3.org/2000/svg','circle');
+        glow.setAttribute('cx',n.x); glow.setAttribute('cy',n.y);
+        glow.setAttribute('r',meta.r+7);
+        glow.setAttribute('fill','none');
+        glow.setAttribute('stroke','#f59e0b');
+        glow.setAttribute('stroke-width','2');
+        glow.setAttribute('stroke-opacity','0.8');
+        g.appendChild(glow);
+      }
+
+      const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
+      circle.setAttribute('cx',n.x); circle.setAttribute('cy',n.y);
+      circle.setAttribute('r',meta.r);
+      circle.setAttribute('fill',fill);
+      circle.setAttribute('stroke', n.verified===false?'#f59e0b': n.verified===true?'#22c55e':'#475569');
+      circle.setAttribute('stroke-width', n.label==='EvidenceItem'?'2':'1');
+      g.appendChild(circle);
+
+      // Label lines
+      const lines = nodeLabel(n).split('\n');
+      lines.forEach((line,i)=>{
+        const t=document.createElementNS('http://www.w3.org/2000/svg','text');
+        t.setAttribute('x',n.x); t.setAttribute('y', n.y+(i-(lines.length-1)/2)*11+1);
+        t.setAttribute('text-anchor','middle'); t.setAttribute('dominant-baseline','middle');
+        t.setAttribute('font-size',n.label==='Company'?'9':'8');
+        t.setAttribute('font-weight','700'); t.setAttribute('fill',meta.textColor);
+        t.setAttribute('font-family','system-ui');
+        t.textContent=line;
+        g.appendChild(t);
+      });
+
+      // Verified badge on EvidenceItem
+      if(n.label==='EvidenceItem'){
+        const badge=document.createElementNS('http://www.w3.org/2000/svg','text');
+        badge.setAttribute('x',n.x+meta.r-2); badge.setAttribute('y',n.y-meta.r+2);
+        badge.setAttribute('font-size','9'); badge.setAttribute('text-anchor','middle');
+        badge.textContent=n.verified?'✓':'!';
+        badge.setAttribute('fill',n.verified?'#16a34a':'#f59e0b');
+        badge.setAttribute('font-weight','900');
+        g.appendChild(badge);
+      }
+
+      // Click to select / tooltip
+      g.addEventListener('click',()=>{
+        selected=(selected&&selected.id===n.id)?null:n;
+        draw();
+        showTooltip(n);
+      });
+      g.addEventListener('mouseover',e=>showTooltip(n,e));
+      g.addEventListener('mouseout',hideTooltip);
+
+      svg.appendChild(g);
+    });
+  }
+
+  const tooltip=document.getElementById('prov-tooltip');
+  function showTooltip(n, event){
+    if(!tooltip) return;
+    let html='';
+    if(n.label==='Company') html=`<b>${n.name||n.id}</b><br/>Sector: ${n.sector||'—'}`;
+    else if(n.label==='ESGScore') html=`<b>ESG Score</b><br/>Composite: <b>${n.score}</b>`;
+    else if(n.label==='PillarScore') html=`<b>${n.pillar} Pillar</b><br/>Score: <b>${n.score}</b>`;
+    else if(n.label==='MetricScore') html=`<b>${n.metric_id}</b><br/>Score: <b>${n.score}</b><br/>${n.outcome_based?'✅ Outcome-based':'📋 Policy/disclosure'}`;
+    else if(n.label==='EvidenceItem'){
+      html=`<b>${(n.source||'').replace(/_/g,' ')}</b><br/>Type: ${n.type||'—'}<br/>Value: ${n.value!=null?n.value+'%':'—'}<br/>Confidence: ${Math.round((n.confidence||0)*100)}%<br/>${n.verified?'✅ Verified':'⚠ Self-reported'}`;
+    }
+    tooltip.innerHTML=html;
+    tooltip.style.display='block';
+    if(event){
+      const rect=svg.getBoundingClientRect();
+      tooltip.style.left=(event.clientX-rect.left+12)+'px';
+      tooltip.style.top=(event.clientY-rect.top+12)+'px';
+    }
+  }
+  function hideTooltip(){ if(tooltip) tooltip.style.display='none'; }
+
+  draw();
+
+  // Make SVG responsive
+  const ro=new ResizeObserver(()=>{
+    const newW=svg.clientWidth||800;
+    nodes.forEach(n=>{n.x=n.x*(newW/W);});
+    draw();
+  });
+  ro.observe(svg);
 }
 
 // ── render ─────────────────────────────────────────────────────────────

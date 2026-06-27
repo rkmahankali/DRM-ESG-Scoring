@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from src.audit.ledger import AuditLedger
-from src.graph.neo4j_client import GraphClient
+from src.graph.graph_service import GraphService
 from src.ingestion.extractor import APIFeedExtractor, DocumentExtractor, QuestionnaireExtractor
 from src.models.domain import Company, ESGScore, EvidenceItem, GreenwashAlert
 from src.ontology.esg_ontology import ESGOntology
@@ -28,8 +28,9 @@ def get_ledger() -> AuditLedger:
 def get_engine(ontology: Annotated[ESGOntology, Depends(get_ontology)]) -> ScoringEngine:
     return ScoringEngine(ontology)
 
-def get_graph() -> GraphClient:
-    return GraphClient()
+def get_graph() -> GraphService:
+    from src.api.provenance import get_graph as _get_graph
+    return _get_graph()
 
 def get_benchmarker() -> PeerBenchmarker:
     return PeerBenchmarker.default_benchmarks()
@@ -76,7 +77,7 @@ async def score_company(
     engine: Annotated[ScoringEngine, Depends(get_engine)],
     ledger: Annotated[AuditLedger, Depends(get_ledger)],
     benchmarker: Annotated[PeerBenchmarker, Depends(get_benchmarker)],
-    graph: Annotated[GraphClient, Depends(get_graph)],
+    graph: Annotated[GraphService, Depends(get_graph)],
 ):
     if req.config:
         engine = ScoringEngine(engine.ontology, req.config)
@@ -104,13 +105,15 @@ async def score_company(
     )
     esg_score.audit_log_id = audit_id
 
-    # Persist to knowledge graph asynchronously (best-effort)
-    evidence_ids = [ev.id for ev in req.evidence]
-    graph.store_score(esg_score.id, req.company.id, {
-        "composite_score": esg_score.composite_score,
-        "confidence": esg_score.confidence,
-        "greenwash_risk": esg_score.greenwash_risk,
-    }, evidence_ids)
+    # Populate knowledge graph (in-memory or Neo4j)
+    try:
+        graph.store_company(req.company.id, req.company.name,
+                            req.company.sector, req.company.jurisdiction,
+                            req.company.is_listed)
+        graph.store_evidence_items(req.evidence)
+        graph.store_score(req.company.id, esg_score, req.evidence)
+    except Exception:
+        pass  # graph is best-effort; score is already persisted in audit ledger
 
     return ScoreResponse(score=esg_score, alerts=alerts, audit_id=audit_id)
 
